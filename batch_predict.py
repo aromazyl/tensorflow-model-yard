@@ -1,0 +1,103 @@
+"""
+Used to load and apply a trained faststyle model to an image in order to
+stylize it.
+
+File author: Grant Watson
+Date: Jan 2017
+"""
+
+import tensorflow as tf
+import numpy as np
+import os
+# from im_transf_net import create_net
+# import mnet_model as model
+import model_low_filter as model
+import argparse
+import utils
+import image_util as iu
+
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   # see issue #152
+os.environ["CUDA_VISIBLE_DEVICES"]="-1"
+
+
+# TODO: handle the upsampling thing better. Really, shouldn't need to
+# explicitly have to give it.
+
+
+def setup_parser():
+    """Options for command-line input."""
+    parser = argparse.ArgumentParser(description="""Use a trained fast style
+                                     transfer model to filter an input
+                                     image, and save to an output image.""")
+    parser.add_argument('--input_img_path',
+                        help='Input content image that will be stylized.')
+    parser.add_argument('--output_img_path',
+                        help='Desired output image path.',
+                        default='./results/styled.jpg')
+    parser.add_argument('--model_path',
+                        default='./models/starry_final.ckpt',
+                        help='Path to .ckpt for the trained model.')
+    parser.add_argument('--content_target_resize',
+                        help="""Resize input content image. Useful if having
+                        OOM issues.""",
+                        default=1.0,
+                        type=float)
+    parser.add_argument('--upsample_method',
+                        help="""The upsample method that was used to construct
+                        the model being loaded. Note that if the wrong one is
+                        chosen an error will occur.""",
+                        choices=['resize', 'deconv'],
+                        default='resize')
+    return parser
+
+
+if __name__ == '__main__':
+
+    # Command-line argument parsing.
+    parser = setup_parser()
+    args = parser.parse_args()
+    input_img_path = args.input_img_path
+    output_img_path = args.output_img_path
+    model_path = args.model_path
+    upsample_method = args.upsample_method
+    content_target_resize = args.content_target_resize
+
+    # Read + preprocess input image.
+    image_files = iu.GetSubPathImages(input_img_path)
+    # img = utils.imread(input_img_path)
+    # img = utils.imresize(img, content_target_resize)
+    # img_4d = img[np.newaxis, :]
+    def get_image(input_img):
+      img = utils.imread(input_img)
+      img = utils.imresize(img, content_target_resize)
+      img_4d = img[np.newaxis, :]
+      return img_4d
+    img_4d = get_image(image_files[0])
+
+    # Create the graph.
+    # with tf.variable_scope('img_t_net'):
+    X = tf.placeholder(tf.float32, shape=img_4d.shape, name='input')
+    # X = tf.placeholder(tf.float32, shape=[None,None,None,None], name='input')
+    Y = model.net(X, False)
+
+    # Saver used to restore the model to the session.
+    saver = tf.train.Saver()
+
+    # Filter the input image.
+    gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.1)
+    with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
+        print 'Loading up model...'
+        saver.restore(sess, model_path)
+        print 'Evaluating...'
+        for image_file in image_files:
+            image = get_image(image_file)
+            print image.shape
+            img_out = sess.run(Y, feed_dict={X: get_image(image_file)})
+            img_out = np.squeeze(img_out)
+            print 'Saving image', image_file
+            utils.imwrite(output_img_path + "/" + image_file.split("/")[-1], img_out)
+            print 'Save Done', "/home/zhangyule/fast-neural-style/" + output_img_path + "/" + image_file.split("/")[-1]
+
+    # Postprocess + save the output image.
+
+    print 'Done.'

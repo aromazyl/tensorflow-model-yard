@@ -1,0 +1,366 @@
+"""
+Train image transformation network in conjunction with perceptual loss. Save
+the image transformation network for later application.
+
+File author: Grant Watson
+Date: Jan 2017
+"""
+
+import tensorflow as tf
+import numpy as np
+from libs import vgg16
+# from im_transf_net import create_net
+# import mnet_model as model
+import model_low_filter as model
+import datapipe
+import os
+import image_util as iu
+import argparse
+import utils
+import random
+import losses
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   # see issue #152
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
+
+
+# TODO: implement conditional default in argparse for beta. Depends on
+# upsampling method.
+
+loss_model = "vgg_16"
+
+def setup_parser():
+    """Used to interface with the command-line."""
+    parser = argparse.ArgumentParser(
+                description='Train a style transfer net.')
+    parser.add_argument('--train_dir',
+                        help='Directory of TFRecords training data.')
+    parser.add_argument('--last_model',
+                            help='Directory of last model file for restore.')
+
+    parser.add_argument('--model_name',
+                        help='Name of model being trained.')
+
+    parser.add_argument('--style_img_path',
+                        default='./style_images/starry_night_crop.jpg',
+                        help='Path to style target image.')
+    parser.add_argument('--learn_rate',
+                        help='Learning rate for Adam optimizer.',
+                        default=1e-3, type=float)
+    parser.add_argument('--batch_size',
+                        help='Batch size for training.',
+                        default=2, type=int)
+    parser.add_argument('--n_epochs',
+                        help='Number of training epochs.',
+                        default=2, type=int)
+    parser.add_argument('--preprocess_size',
+                        help="""Dimensions to resize training images to before passing
+                        them into the image transformation network.""",
+                        default=[512, 512], nargs=2, type=int)
+    parser.add_argument('--run_name',
+                        help="""Name of log directory within the Tensoboard
+                        directory (./summaries). If not set, will use
+                        --model_name to create a unique directory.""",
+                        default=None)
+    parser.add_argument('--loss_content_layers',
+                        help='Names of layers to define content loss.',
+                        nargs='*',
+                        default=['conv2_2'])
+    parser.add_argument('--loss_style_layers',
+                        help='Names of layers to define style loss.',
+                        nargs='*',
+                        default=['conv1_2', 'conv2_2', 'conv3_3', 'conv4_3'])
+    parser.add_argument('--temporal_weight',
+                        help='Weights that mulitply the temporal loss terms.',
+                        default=0.5,
+                        type=float)
+    parser.add_argument('--content_weights',
+                        help="""Weights that multiply the content loss
+                        terms.""",
+                        nargs='*',
+                        default=[2.0],
+                        type=float)
+    parser.add_argument('--style_weights',
+                        help="""Weights that multiply the style loss terms.""",
+                        nargs='*',
+                        default=[5.0, 5.0, 5.0, 5.0],
+                        type=float)
+    parser.add_argument('--num_steps_ckpt',
+                        help="""Save a checkpoint everytime this number of
+                        steps passes in training.""",
+                        default=1000,
+                        type=int)
+    parser.add_argument('--num_pipe_buffer',
+                        help="""Number of images loaded into RAM in pipeline.
+                        The larger, the better the shuffling, but the more RAM
+                        filled, and a slower startup.""",
+                        default=4000,
+                        type=int)
+    parser.add_argument('--num_steps_break',
+                        help="""Max on number of steps. Training ends when
+                        either num_epochs or this is reached (whichever comes
+                        first).""",
+                        default=-1,
+                        type=int)
+    parser.add_argument('--beta',
+                        help="""TV regularization weight. If using deconv for
+                        --upsample_method, try 1.e-4 for starters. Otherwise,
+                        this is not needed.""",
+                        default=0.0,
+                        type=float)
+    parser.add_argument('--style_target_resize',
+                        help="""Scale factor to apply to the style target image.
+                        Can change the dominant stylistic features.""",
+                        default=1.0, type=float)
+    parser.add_argument('--upsample_method',
+                        help="""Either deconvolution as in the original paper,
+                        or the resize convolution method. The latter seems
+                        superior and does not require TV regularization through
+                        beta.""",
+                        choices=['deconv', 'resize'],
+                        default='resize')
+    return parser
+
+def ImageQueue(terms):
+    for i in xrange(terms):
+        folders = iu.GetSubPathImages(args.train_dir)
+        prev = None
+        for folder in folders:
+            ret = []
+            for image in sorted(iu.GetSubPathImages(folder)):
+                if prev != None:
+                    ret.append((prev, image))
+                prev = image
+            yield ret
+
+
+
+
+def main(args):
+    """main
+
+    :param args:
+        argparse.Namespace object from argparse.parse_args().
+    """
+    # Unpack command-line arguments.
+    train_dir = args.train_dir
+    style_img_path = args.style_img_path
+    model_name = args.model_name
+    preprocess_size = args.preprocess_size
+    batch_size = args.batch_size
+    n_epochs = args.n_epochs
+    run_name = args.run_name
+    learn_rate = args.learn_rate
+    loss_content_layers = args.loss_content_layers
+    loss_style_layers = args.loss_style_layers
+    content_weights = args.content_weights
+    temporal_weight = args.temporal_weight
+    style_weights = args.style_weights
+    num_steps_ckpt = args.num_steps_ckpt
+    num_pipe_buffer = args.num_pipe_buffer
+    num_steps_break = args.num_steps_break
+    beta_val = args.beta
+    style_target_resize = args.style_target_resize
+    upsample_method = args.upsample_method
+
+    # Load in style image that will define the model.
+    style_img = utils.imread(style_img_path)
+    style_img = utils.imresize(style_img, style_target_resize)
+    style_img = style_img[np.newaxis, :].astype(np.float32)
+
+    # Alter the names to include a namescope that we'll use + output suffix.
+    loss_style_layers = ['vgg/' + i + ':0' for i in loss_style_layers]
+    loss_content_layers = ['vgg/' + i + ':0' for i in loss_content_layers]
+
+    # Get target Gram matrices from the style image.
+    with tf.variable_scope('vgg'):
+        X_vgg = tf.placeholder(tf.float32, shape=style_img.shape, name='input')
+        vggnet = vgg16.vgg16(X_vgg)
+
+    gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.333)
+    with tf.Session(config=tf.ConfigProto(gpu_options = gpu_options)) as sess:
+        vggnet.load_weights('libs/vgg16_weights.npz', sess)
+        print 'Precomputing target style layers.'
+        target_grams = sess.run(utils.get_grams(loss_style_layers),
+                                feed_dict={X_vgg: style_img})
+
+    # Clean up so we can re-create vgg connected to our image network.
+    print 'Resetting default graph.'
+    tf.reset_default_graph()
+
+    # Load in image transformation network into default graph.
+    shape = [batch_size] + preprocess_size + [3]
+    # with tf.variable_scope("img_t_net"):
+    X = tf.placeholder(tf.float32, shape=shape, name='input')
+    op_flow = tf.placeholder(tf.float32, shape=preprocess_size + [2])
+    Y = model.net(X, True)
+    tf.logging.info(tf.shape(Y))
+
+    # Connect vgg directly to the image transformation network.
+    with tf.variable_scope('vgg'):
+        vggnet = vgg16.vgg16(Y)
+
+    Y1 = Y[0,:]
+    Y2 = Y[1,:]
+    # images_net_out = tf.unstack(Y)
+
+    image_height = preprocess_size[0]
+    image_width = preprocess_size[1]
+    # Y1 = tf.reshape(images_net_out[0], shape=(image_height, image_width, 3))
+    # Y2 = tf.reshape(images_net_out[1], shape=(image_height, image_width, 3))
+    temporal_loss = losses.temporal_loss(Y1, Y2, op_flow, image_width, image_height) * float(temporal_weight)
+
+    # Get the gram matrices' tensors for the style loss features.
+    input_img_grams = utils.get_grams(loss_style_layers)
+
+    # Get the tensors for content loss features.
+    content_layers = utils.get_layers(loss_content_layers)
+
+    # Create loss function
+    content_targets = tuple(tf.placeholder(tf.float32,
+                            shape=layer.get_shape(),
+                            name='content_input_{}'.format(i))
+                            for i, layer in enumerate(content_layers))
+    content_loss = losses.content_loss(content_layers, content_targets,
+                                    content_weights)
+    style_loss = losses.style_loss(input_img_grams, target_grams,
+                                   style_weights)
+    tv_loss = losses.tv_loss(Y)
+    beta = tf.placeholder(tf.float32, shape=[], name='tv_scale')
+    loss = content_loss + style_loss + beta * tv_loss + temporal_loss
+    """
+    with tf.name_scope('summaries'):
+        tf.summary.scalar('loss', loss)
+        tf.summary.scalar('style_loss', style_loss)
+        tf.summary.scalar('content_loss', content_loss)
+        tf.summary.scalar('tv_loss', beta*tv_loss)
+    """
+
+    # Setup input pipeline (delegate it to CPU to let GPU handle neural net)
+    # files = tf.train.match_filenames_once(train_dir + '/train-*')
+    """
+    with tf.variable_scope('input_pipe'), tf.device('/cpu:0'):
+        batch_op = datapipe.batcher(files, batch_size, preprocess_size,
+                                    n_epochs, num_pipe_buffer)
+    """
+
+    # We do not want to train VGG, so we must grab the subset.
+
+    train_vars = filter(lambda x: not x.name.startswith("vgg"), tf.trainable_variables())
+    # train_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,
+    #                                 scope='img_t_net')
+    # Setup step + optimizer
+    global_step = tf.Variable(0, name='global_step', trainable=False)
+    optimizer = tf.train.AdamOptimizer(learn_rate).minimize(loss, global_step,
+                                                            train_vars)
+
+    # Setup subdirectory for this run's Tensoboard logs.
+    """
+    if not os.path.exists('./summaries/train/'):
+        os.makedirs('./summaries/train/')
+    """
+    # if run_name is None:
+    #     current_dirs = [name for name in os.listdir('./summaries/train/')
+    #                     if os.path.isdir('./summaries/train/' + name)]
+    #     name = model_name + '0'
+    #     count = 0
+    #     while name in current_dirs:
+    #         count += 1
+    #         name = model_name + '{}'.format(count)
+    #     run_name = name
+
+    # Savers and summary writers
+    if not os.path.exists('./flow_training'):  # Dir that we'll later save .ckpts to
+        os.makedirs('./flow_training')
+    if not os.path.exists('./models'):  # Dir that save final models to
+        os.makedirs('./models')
+    saver = tf.train.Saver(train_vars)
+    final_saver = tf.train.Saver(train_vars)
+    # merged = tf.summary.merge_all()
+    # full_log_path = './summaries/train/' + run_name
+    # train_writer = tf.summary.FileWriter(full_log_path)
+
+    # We must include local variables because of batch pipeline.
+    init_op = tf.group(tf.global_variables_initializer(),
+                       tf.local_variables_initializer())
+
+    # Begin training.
+    print 'Starting training...'
+    with tf.Session() as sess:
+        # Initialization
+        sess.run(init_op)
+        vggnet.load_weights('libs/vgg16_weights.npz', sess)
+        last_file = args.last_model
+        if last_file:
+            tf.logging.info('Restoring model from {}'.format(last_file))
+            saver.restore(sess, last_file)
+
+        # coord = tf.train.Coordinator()
+        # threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+        image_que = ImageQueue(20)
+        images_pair = []
+        for image_names in image_que:
+            for prev_curr_pair in image_names:
+                images_pair.append(prev_curr_pair)
+
+        random.shuffle(images_pair)
+
+        try:
+            # while not coord.should_stop():
+            for prev_curr_pair in images_pair:
+                current_step = sess.run(global_step)
+                # batch = sess.run(batch_op)
+                prev, curr = prev_curr_pair[0], prev_curr_pair[1]
+                batch = np.stack([iu.ReadImage(prev), iu.ReadImage(curr)])
+
+                # Collect content targets
+                content_data = sess.run(content_layers,
+                                        feed_dict={Y: batch})
+
+                feed_dict = {X: batch,
+                             op_flow: iu.GetImageFlow(iu.GetImageGray(prev), iu.GetImageGray(curr)),
+                             content_targets: content_data,
+                             beta: beta_val}
+
+                if (current_step % num_steps_ckpt == 0):
+                    # Save a checkpoint
+                    save_path = 'flow_training/' + model_name + '.ckpt'
+                    saver.save(sess, save_path, global_step=global_step)
+                    _, loss_out, c_loss, s_loss, t_loss = sess.run([optimizer, loss, content_loss, style_loss, tv_loss],
+                                                    feed_dict=feed_dict)
+                    # train_writer.add_summary(summary, current_step)
+                    print current_step, loss_out
+
+                elif (current_step % 10 == 0):
+                    # Collect some diagnostic data for Tensorboard.
+                    _, loss_out, c_loss, s_loss, t_loss = sess.run([optimizer, loss, content_loss, style_loss, tv_loss],
+                                                    feed_dict=feed_dict)
+                    # train_writer.add_summary(summary, current_step)
+
+                    # Do some standard output.
+                    print current_step, loss_out
+                else:
+                    _, loss_out, c_loss, s_loss, t_loss = sess.run([optimizer, loss, content_loss, style_loss, tv_loss],
+                                           feed_dict=feed_dict)
+
+                tf.logging.info("step:%s, loss: %s, content_loss:%s, style_loss:%s, tv_loss:%s", current_step, loss_out, c_loss, s_loss, t_loss)
+
+                # Throw error if we reach number of steps to break after.
+                if current_step == num_steps_break:
+                    print('Done training.')
+                    break
+        except tf.errors.OutOfRangeError:
+            print('Done training.')
+        finally:
+            # Save the model (the image transformation network) for later usage
+            # in predict.py
+            final_saver.save(sess, 'models/' + model_name + '_final.ckpt')
+
+            # coord.request_stop()
+
+        # coord.join(threads)
+
+if __name__ == "__main__":
+    parser = setup_parser()
+    args = parser.parse_args()
+    tf.logging.set_verbosity(tf.logging.INFO)
+    main(args)
